@@ -1,0 +1,116 @@
+--- a/il_translator_llm_only.py
++++ b/il_translator_llm_only.py
+@@ -48,6 +48,10 @@
+ 3. Inside each paragraph, you may adjust word order for fluency, but:
+    - Do NOT change the meaning.
+    - Do NOT move placeholders, tags, or code outside their paragraph.
++   - Markers like [[CITE:v1:96,120]] are immutable inline citations or numeric superscripts.
++   - Copy every CITE marker EXACTLY ONCE.
++   - Keep each CITE marker attached to the SAME preceding word, phrase, or clause as in the input.
++   - NEVER move a CITE marker to the beginning of a sentence, before a verb, or onto another phrase.
+ 4. Translate ALL human-readable content into $lang_out.
+ 
+ ## Do NOT Modify
+@@ -678,20 +682,43 @@
+                 tracker.record_multi_paragraph_index(id_)
+                 placeholders_hint = ti.get_placeholders_hint()
+ 
+-                # CITATION DEBUG: inspect formula placeholders before LLM
+-                if "{v" in input_text[0]:
++
++                # CITATION PROTECT:
++                # Convert numeric superscript/formula placeholders such as
++                # {v1} -> [[CITE:v1:96,120]]
++                # so the LLM knows this is an immutable inline citation.
++                protected_input = input_text[0]
++                protected_refs = []
++
++                if placeholders_hint:
++                    for _ph, _value in placeholders_hint.items():
++                        _value_s = str(_value).strip()
++
++                        # Matches:
++                        # 22
++                        # 96,120
++                        # 82–84
++                        # 143-145
++                        # 20,98,99
++                        if re.fullmatch(
++                            r"\d+(?:\s*[-–—]\s*\d+)?"
++                            r"(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*(?:\s*,)?",
++                            _value_s,
++                        ):
++                            _pid = _ph.strip("{}")
++                            _marker = f"[[CITE:{_pid}:{_value_s}]]"
++                            protected_input = protected_input.replace(_ph, _marker)
++                            protected_refs.append((_ph, _value_s))
++
++                if protected_refs:
+                     print(
+-                        f"[CITATION-DEBUG] id={id_} input={input_text[0]!r}",
++                        f"[CITATION-PROTECT] id={id_} refs={protected_refs!r}",
+                         flush=True,
+                     )
+-                    print(
+-                        f"[CITATION-DEBUG] placeholders={placeholders_hint!r}",
+-                        flush=True,
+-                    )
+ 
+                 obj = {
+                     "id": id_,
+-                    "input": input_text[0],
++                    "input": protected_input,
+                     "layout_label": input_text[2].layout_label,
+                 }
+                 if (
+@@ -768,6 +795,50 @@
+                     # Get the original input for this translation
+                     translate_input = inputs[id_][1]
+                     llm_translate_tracker = inputs[id_][4]
++
++                    # CITATION PROTECT:
++                    # Verify numeric citation markers survived the LLM,
++                    # then restore them to BabelDOC's original {vN} placeholders.
++                    _citation_value_re = re.compile(
++                        r"^\d+(?:\s*[-–—]\s*\d+)?"
++                        r"(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*(?:\s*,)?$"
++                    )
++                    _citation_marker_re = re.compile(
++                        r"\[\[\s*CITE\s*:\s*(v\d+)\s*:"
++                        r"\s*([0-9,\s\-–—]+)\s*\]\]"
++                    )
++
++                    _expected_cite_ids = []
++                    _hints = translate_input.get_placeholders_hint()
++
++                    if _hints:
++                        for _ph, _value in _hints.items():
++                            _value_s = str(_value).strip()
++                            if _citation_value_re.fullmatch(_value_s):
++                                _expected_cite_ids.append(_ph.strip("{}"))
++
++                    if _expected_cite_ids:
++                        _actual = _citation_marker_re.findall(translated_text)
++                        _actual_cite_ids = [x[0] for x in _actual]
++
++                        if _actual_cite_ids != _expected_cite_ids:
++                            raise ValueError(
++                                "Citation marker mismatch: "
++                                f"expected={_expected_cite_ids}, "
++                                f"actual={_actual_cite_ids}, "
++                                f"output={translated_text!r}"
++                            )
++
++                        translated_text = _citation_marker_re.sub(
++                            lambda m: "{" + m.group(1) + "}",
++                            translated_text,
++                        )
++
++                        print(
++                            f"[CITATION-PROTECT] restored "
++                            f"{len(_expected_cite_ids)} citation marker(s)",
++                            flush=True,
++                        )
+ 
+                     input_unicode = inputs[id_][0]
+                     output_unicode = translated_text

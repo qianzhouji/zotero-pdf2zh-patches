@@ -1,0 +1,66 @@
+{
+  "version": "2.0",
+  "babeldoc_version": "0.6.2",
+  "files": [
+    {
+      "path": "document_il/midend/il_translator_llm_only.py",
+      "installed": "payload/il_translator_llm_only.py",
+      "installed_hash": "1399710aeb44cafe985c1fb23c3615124165faf11037b3b3dffa1664f730c554",
+      "baseline": "baseline/il_translator_llm_only.py",
+      "baseline_hash": "526cb772094ce89109be6a80d5406f8d2285f7a1ecb1153633bb47e9fe38ed04",
+      "accepted_hashes": [
+        "5bc8638df2d9835a32533a8bd9ca03bb63f3706f562600e38d8d74143207e3c4",
+        "1399710aeb44cafe985c1fb23c3615124165faf11037b3b3dffa1664f730c554",
+        "79c97edf80def4691d36db2e328d6ac80d9aeac4bae67d61ee534221087a967a",
+        "526cb772094ce89109be6a80d5406f8d2285f7a1ecb1153633bb47e9fe38ed04"
+      ]
+    },
+    {
+      "path": "document_il/midend/styles_and_formulas.py",
+      "installed": "payload/styles_and_formulas.py",
+      "installed_hash": "15820440228ddeba27c912d74efd030055219d64f63de0b671c9c86ccdefd9e4",
+      "baseline": "baseline/styles_and_formulas.py",
+      "baseline_hash": "5ee979f1c7ef1d48f4a32d9d07402e134f8a8fc91c5bfb5c6ce87d5f3fa2ba1d",
+      "accepted_hashes": [
+        "1869939926cc9e9a2bec20cae7f85bd89c087286f389b1b7755199b04a57ebb3",
+        "49f8e65d4349061965c54b379edd2d08c57087c3aa23268c16ef4fe21b0b41b0",
+        "5ee979f1c7ef1d48f4a32d9d07402e134f8a8fc91c5bfb5c6ce87d5f3fa2ba1d",
+        "15820440228ddeba27c912d74efd030055219d64f63de0b671c9c86ccdefd9e4"
+      ]
+    },
+    {
+      "path": "new_parser/native_parse.py",
+      "installed": "payload/native_parse.py",
+      "installed_hash": "6effcea08ba2a021e791e68dbc306eb7b5486d6dd2f7c358e28437c335ff92f7",
+      "baseline": "baseline/native_parse.py",
+      "baseline_hash": "beac88d68ed59b7ca60bfc7f78ee2fefb66240f3b06dc5b43121597887686bd1",
+      "accepted_hashes": [
+        "beac88d68ed59b7ca60bfc7f78ee2fefb66240f3b06dc5b43121597887686bd1",
+        "6effcea08ba2a021e791e68dbc306eb7b5486d6dd2f7c358e28437c335ff92f7"
+      ]
+    },
+    {
+      "path": "document_il/utils/inline_math_protect.py",
+      "installed": "payload/inline_math_protect.py",
+      "installed_hash": "a66f9d99573fd371dff1bd04f36f8cbdd399fbe1a261c399b67f3bf383f98a38",
+      "baseline": null,
+      "baseline_hash": null,
+      "accepted_hashes": [
+        null,
+        "591c7fe843421701661ab67a06d95e2d7b5fe7c00337eedf30264d0174a161dc",
+        "a66f9d99573fd371dff1bd04f36f8cbdd399fbe1a261c399b67f3bf383f98a38"
+      ]
+    },
+    {
+      "path": "document_il/utils/layout_helper.py",
+      "installed": "payload/layout_helper.py",
+      "installed_hash": "dca49b5c872d0ea9a10755a81b5e6bb983f6f2fe883eec467520399cbadc9217",
+      "baseline": "baseline/layout_helper.py",
+      "baseline_hash": "c436b037e765c2d332f9925fee6f32ba99b8e7a7afce3bdb30fe7aa04b38e5e5",
+      "accepted_hashes": [
+        "c436b037e765c2d332f9925fee6f32ba99b8e7a7afce3bdb30fe7aa04b38e5e5",
+        "dca49b5c872d0ea9a10755a81b5e6bb983f6f2fe883eec467520399cbadc9217"
+      ]
+    }
+  ]
+}

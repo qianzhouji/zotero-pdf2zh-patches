@@ -1,0 +1,197 @@
+--- a/styles_and_formulas.py
++++ b/styles_and_formulas.py
+@@ -379,6 +379,27 @@
+         if not self.translation_config.skip_formula_offset_calculation:
+             self.process_page_offsets(page)
+         self.update_all_formula_data(page)
++        # Main-size inline glyphs align to their own source baseline, not to
++        # text on a different source line. Preserve smaller superscript offsets.
++        from statistics import median
++        for paragraph in page.pdf_paragraph:
++            prose = [ch for comp in paragraph.pdf_paragraph_composition if comp.pdf_line
++                     for ch in comp.pdf_line.pdf_character if (ch.char_unicode or "").strip()]
++            if not prose:
++                continue
++            base_size = median(ch.pdf_style.font_size for ch in prose)
++            for comp in paragraph.pdf_paragraph_composition:
++                if not comp.pdf_formula:
++                    continue
++                formula = comp.pdf_formula
++                glyphs = [ch for ch in formula.pdf_character if (ch.char_unicode or "").strip()]
++                if not glyphs:
++                    continue
++                size = max(ch.pdf_style.font_size for ch in glyphs)
++                if size < base_size * 0.85:
++                    continue
++                baseline = median(ch.box.y for ch in glyphs if ch.pdf_style.font_size >= size * 0.9)
++                formula.y_offset = formula.box.y - baseline
+         self.process_page_styles(page)
+ 
+     def update_line_data(self, line: PdfLine):
+@@ -394,6 +415,7 @@
+         formula_font_ids: set[int],
+         first_is_bullet_so_far: bool,
+         line_index: int,
++        font_map=None,
+     ) -> tuple[list[tuple[PdfCharacter, bool]], bool]:
+         """
+         Phase 1: Classify every character in a composition as either formula or text.
+@@ -468,6 +490,24 @@
+                 else False
+             )
+ 
++            # INLINE MATH SPAN INTEGRITY V1:
++            # Keep a decimal point inside the formula span so e.g. 0.58 is
++            # not split into a protected integer, movable punctuation, and
++            # another numeric fragment.
++            _previous_text = previous_char.char_unicode if previous_char else None
++            _next_text = next_char.char_unicode if next_char else None
++            _is_decimal_separator = (
++                char.char_unicode in {".", "．"}
++                and _previous_text is not None
++                and len(_previous_text) == 1
++                and _previous_text.isdigit()
++                and _next_text is not None
++                and len(_next_text) == 1
++                and _next_text.isdigit()
++            )
++            if _is_decimal_separator:
++                is_formula = True
++
+             is_corner_mark = (
+                 (
+                     previous_char is not None
+@@ -502,7 +542,7 @@
+                 )
+             )
+ 
+-            is_formula = is_formula or is_corner_mark
++            is_formula = is_formula or is_corner_mark or _is_decimal_separator
+ 
+             if char.char_unicode == " ":
+                 is_formula = in_formula_state
+@@ -520,7 +560,8 @@
+         ):
+             tagged_chars.append((char, is_formula, is_corner_mark))
+ 
+-        return tagged_chars, first_is_bullet
++        from babeldoc.format.pdf.document_il.utils.inline_math_protect import complete_math_runs
++        return complete_math_runs(tagged_chars, font_map), first_is_bullet
+ 
+     def _group_classified_characters(
+         self,
+@@ -537,8 +578,28 @@
+         current_chars = []
+         current_tag = tagged_chars[0][1]
+         current_corner_mark_flags = []
++        physical_line_id = line_index * 1000
++        previous_char = None
+ 
+         for char, is_formula_tag, is_corner_mark in tagged_chars:
++            # A paragraph line can contain two physical baselines when a
++            # superscript bridges the histogram gap. Do not make a huge,
++            # two-line inline formula out of the end/start of those lines.
++            if previous_char is not None:
++                em = max(char.pdf_style.font_size, previous_char.pdf_style.font_size)
++                wrapped = (previous_char.box.x - char.box.x > 2 * em
++                           and abs(previous_char.box.y - char.box.y) > 0.75 * em)
++                if wrapped:
++                    if current_chars:
++                        new_compositions.append(self.create_composition(
++                            current_chars, current_tag, physical_line_id,
++                            any(current_corner_mark_flags),
++                        ))
++                    current_chars = []
++                    current_corner_mark_flags = []
++                    current_tag = is_formula_tag
++                    physical_line_id += 1
++            previous_char = char
+             if is_formula_tag == current_tag:
+                 current_chars.append(char)
+                 current_corner_mark_flags.append(is_corner_mark)
+@@ -547,7 +608,7 @@
+                 has_corner_mark = any(current_corner_mark_flags)
+                 new_compositions.append(
+                     self.create_composition(
+-                        current_chars, current_tag, line_index, has_corner_mark
++                        current_chars, current_tag, physical_line_id, has_corner_mark
+                     ),
+                 )
+                 current_chars = [char]
+@@ -559,7 +620,7 @@
+             has_corner_mark = any(current_corner_mark_flags)
+             new_compositions.append(
+                 self.create_composition(
+-                    current_chars, current_tag, line_index, has_corner_mark
++                    current_chars, current_tag, physical_line_id, has_corner_mark
+                 ),
+             )
+ 
+@@ -590,6 +651,10 @@
+             else:
+                 current_formula_font_ids = page_level_formula_font_ids
+ 
++            current_font_map = {font.font_id: font for font in page.pdf_font}
++            for xobj in page.pdf_xobject:
++                if xobj.xobj_id == paragraph.xobj_id:
++                    current_font_map.update({font.font_id: font for font in xobj.pdf_font})
+             new_paragraph_compositions = []
+             # This flag is carried through all compositions in a paragraph, as in the original implementation.
+             first_is_bullet = False
+@@ -605,6 +670,7 @@
+                     current_formula_font_ids,
+                     first_is_bullet,
+                     line_index,
++                    current_font_map,
+                 )
+ 
+                 if not tagged_chars:
+@@ -627,10 +693,27 @@
+             if not paragraph.pdf_paragraph_composition:
+                 continue
+ 
++            # Numeric formula spans inside prose stay as PdfFormula objects.
++            # The downstream LLM placeholder guard can then preserve their
++            # exact characters and position. Standalone numeric paragraphs
++            # retain the legacy conversion behavior.
++            _has_inline_text = any(
++                composition.pdf_line is not None
++                for composition in paragraph.pdf_paragraph_composition
++            )
++
+             new_compositions = []
+             for composition in paragraph.pdf_paragraph_composition:
++                if (composition.pdf_formula is not None
++                    and all(not (char.char_unicode or "").strip()
++                            for char in composition.pdf_formula.pdf_character)):
++                    new_line = PdfLine(pdf_character=composition.pdf_formula.pdf_character)
++                    self.update_line_data(new_line)
++                    new_compositions.append(PdfParagraphComposition(pdf_line=new_line))
++                    continue
+                 if (
+-                    composition.pdf_formula is not None
++                    not _has_inline_text
++                    and composition.pdf_formula is not None
+                     and not composition.pdf_formula.is_corner_mark
+                     and self.is_translatable_formula(
+                         composition.pdf_formula,
+@@ -1091,6 +1174,19 @@
+                     for j in range(i + 1, len(paragraph.pdf_paragraph_composition)):
+                         comp2 = paragraph.pdf_paragraph_composition[j]
+                         if comp2.pdf_formula is None:
++                            continue
++
++                        # INLINE MATH SPAN INTEGRITY V2: a shared layout region
++                        # must not merge separate parameters across prose.
++                        # E.g. gamma=0.41, "hemodynamic transit time", tau=0.98.
++                        intervening = paragraph.pdf_paragraph_composition[i + 1:j]
++                        if any(
++                            comp.pdf_line and any(
++                                (char.char_unicode or "").strip()
++                                for char in comp.pdf_line.pdf_character
++                            )
++                            for comp in intervening
++                        ):
+                             continue
+ 
+                         formula1 = comp1.pdf_formula

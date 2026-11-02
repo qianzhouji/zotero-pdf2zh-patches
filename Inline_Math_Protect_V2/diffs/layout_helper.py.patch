@@ -1,0 +1,15 @@
+--- a/layout_helper.py
++++ b/layout_helper.py
+@@ -774,6 +774,12 @@
+     if not matching_layouts:
+         return None
+ 
++    # INLINE MATH PROTECT V2: touching the bottom edge of a title box
++    # must not steal ascenders from the fully covered body line below it.
++    substantial = [entry for entry in matching_layouts if entry["iou"] >= 0.5]
++    if substantial:
++        matching_layouts = substantial
++
+     # Sort by priority (ascending) and IoU value (descending)
+     matching_layouts.sort(key=lambda x: (x["priority"], -x["iou"]))
+ 

@@ -1,0 +1,462 @@
+--- a/automatic_term_extractor.py
++++ b/automatic_term_extractor.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import logging
++import re
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+@@ -142,6 +143,7 @@
+         self.translation_config = translation_config
+         self.shared_context = translation_config.shared_context_cross_split_part
+         self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
++        self._reference_skip_ids: set[int] = set()
+ 
+         # Check if the translate_engine has llm_translate capability
+         if not hasattr(self.translate_engine, "llm_translate") or not callable(
+@@ -150,6 +152,416 @@
+             raise ValueError(
+                 "The provided translate_engine does not support LLM-based translation, which is required for AutomaticTermExtractor."
+             )
++
++
++
++    # >>> REFERENCE SKIP HELPERS >>>
++
++    _REFERENCE_HEADINGS = {
++        "references",
++        "reference",
++        "bibliography",
++        "reference list",
++        "references cited",
++        "literature cited",
++        "cited literature",
++        "works cited",
++        "references and notes",
++        "references & notes",
++        "notes and references",
++        "references and further reading",
++        "further reading",
++        "supplementary references",
++        "supplemental references",
++        "appendix references",
++    }
++
++    # Text rules are fallback only.
++    # Structural detection is preferred.
++    _REFERENCE_END_HEADINGS = {
++        "appendix",
++        "appendices",
++        "online appendix",
++        "web appendix",
++        "eappendix",
++        "supplement",
++        "supplements",
++        "supplementary material",
++        "supplementary materials",
++        "supplementary information",
++        "supplementary appendix",
++        "supplemental material",
++        "supplemental materials",
++        "supplemental information",
++        "supplemental appendix",
++        "supporting information",
++        "electronic supplementary material",
++        "online supplementary material",
++        "online supplement",
++        "additional file",
++        "additional files",
++        "author contributions",
++        "author contribution",
++        "funding",
++        "funding information",
++        "institutional review board statement",
++        "informed consent statement",
++        "data availability statement",
++        "data availability",
++        "availability of data and materials",
++        "acknowledgments",
++        "acknowledgements",
++        "acknowledge",
++        "acknowledgment",
++        "acknowledgement",
++        "conflicts of interest",
++        "conflict of interest",
++        "competing interests",
++        "declaration of competing interest",
++        "ethics statement",
++        "ethical approval",
++
++        "figure titles and legends",
++        "figure titles & legends",
++        "figure legends",
++        "figure legend",
++        "figure captions",
++        "figure captions and legends",
++        "figure legends and captions",
++        "table titles and legends",
++        "table titles & legends",
++        "table legends",
++        "table legend",
++        "table captions",
++        "table captions and legends",
++        "table legends and captions",
++        "figures",
++        "tables",
++    }
++
++    @staticmethod
++    def _normalize_reference_heading(text: str) -> str:
++        text = re.sub(r"\s+", " ", text or "").strip().lower()
++
++        # "8. References" / "12 References" -> "references"
++        text = re.sub(
++            r"^\s*(?:section\s+)?\d+(?:\.\d+)*[.)]?\s+",
++            "",
++            text,
++            flags=re.IGNORECASE,
++        )
++
++        return text.strip(" .:：;；-_—–")
++
++    @staticmethod
++    def _normalize_layout_label(paragraph) -> str:
++        label = getattr(paragraph, "layout_label", None) or ""
++        return re.sub(
++            r"[\s_-]+",
++            " ",
++            str(label).strip().lower(),
++        )
++
++    def _is_reference_heading(self, text: str) -> bool:
++        norm = self._normalize_reference_heading(text)
++
++        if norm in self._REFERENCE_HEADINGS:
++            return True
++
++        # Also tolerate: R E F E R E N C E S
++        if len(norm) <= 60:
++            compact = re.sub(r"[^a-z]", "", norm)
++
++            if compact in {
++                "references",
++                "reference",
++                "bibliography",
++                "referencelist",
++                "referencescited",
++                "literaturecited",
++                "citedliterature",
++                "workscited",
++                "referencesandnotes",
++                "notesandreferences",
++                "referencesandfurtherreading",
++                "furtherreading",
++                "supplementaryreferences",
++                "supplementalreferences",
++                "appendixreferences",
++            }:
++                return True
++
++        return False
++
++    def _is_reference_end_heading(self, text: str) -> bool:
++        """
++        Text fallback.
++        Structural detection is the primary mechanism.
++        """
++        norm = self._normalize_reference_heading(text)
++
++        if norm in self._REFERENCE_END_HEADINGS:
++            return True
++
++
++        # Common post-reference figure/table sections.
++        # Use controlled prefix matching rather than arbitrary substring
++        # matching, so normal bibliography text is not accidentally treated
++        # as a new section.
++        _legend_section_prefixes = (
++            "figure titles and legends",
++            "figure titles & legends",
++            "figure legends",
++            "figure legend",
++            "figure captions",
++            "figure captions and legends",
++            "figure legends and captions",
++            "table titles and legends",
++            "table titles & legends",
++            "table legends",
++            "table legend",
++            "table captions",
++            "table captions and legends",
++            "table legends and captions",
++        )
++
++        if any(
++            norm == heading or norm.startswith(heading + " ")
++            for heading in _legend_section_prefixes
++        ):
++            return True
++
++        if norm.startswith((
++            "appendix ",
++            "online appendix ",
++            "web appendix ",
++            "eappendix ",
++            "supplement ",
++            "supplements ",
++            "supplementary ",
++            "supplemental ",
++            "supporting information ",
++            "electronic supplementary ",
++            "online supplementary ",
++            "online supplement ",
++            "additional file ",
++        )):
++            return True
++
++        return False
++
++    def _is_reference_noise(self, paragraph, text: str) -> bool:
++        """
++        Ignore page numbers / headers / abandoned fragments when deciding
++        whether a block is the first meaningful object of a new page.
++        """
++        label = self._normalize_layout_label(paragraph)
++        stripped = re.sub(r"\s+", " ", text or "").strip()
++
++        if label in {
++            "abandon",
++            "header",
++            "footer",
++            "page number",
++            "page",
++        }:
++            return True
++
++        if re.fullmatch(r"\d{1,4}", stripped):
++            return True
++
++        if re.fullmatch(
++            r"(?i)[ivxlcdm]{1,8}",
++            stripped,
++        ):
++            return True
++
++        return False
++
++    def _is_strong_post_reference_structure(self, paragraph) -> bool:
++        """
++        Strong evidence that References has ended.
++
++        Confirmed example from the McKinnon test:
++            Table 1 -> layout_label='table_caption'
++        """
++        label = self._normalize_layout_label(paragraph)
++
++        if label in {
++            "table caption",
++            "figure caption",
++            "image caption",
++        }:
++            return True
++
++        if "caption" in label:
++            return True
++
++        return False
++
++    def _is_heading_like_layout(self, paragraph) -> bool:
++        """
++        Heading/title is a weaker signal because BabelDOC may occasionally
++        label fragments inside a reference entry as 'title'.
++
++        Therefore heading labels only terminate References when they are
++        the first meaningful block of a new page.
++        """
++        label = self._normalize_layout_label(paragraph)
++
++        if label in {
++            "title",
++            "heading",
++            "section",
++            "section title",
++            "section heading",
++            "section header",
++            "chapter title",
++        }:
++            return True
++
++        if "heading" in label:
++            return True
++
++        if label.endswith(" title"):
++            return True
++
++        return False
++
++    def _prepare_reference_skip_ids(self, docs) -> None:
++        """
++        Structure-first bibliography detection.
++
++        1. References heading itself remains translatable.
++        2. Bibliography entries bypass the LLM.
++        3. Captions strongly terminate Reference Mode.
++        4. A heading terminates Reference Mode only when it is the first
++           meaningful block on a new page.
++        5. Explicit heading text remains a fallback.
++        """
++        self._reference_skip_ids = set()
++
++        pages = list(docs.page)
++
++        if not pages:
++            return
++
++        min_page_index = int(len(pages) * 0.35)
++
++        in_references = False
++        detected_reference = False
++        skipped = 0
++
++        for page_index, page in enumerate(pages):
++            meaningful_count = 0
++
++            for paragraph in page.pdf_paragraph:
++                text = getattr(
++                    paragraph,
++                    "unicode",
++                    None,
++                )
++
++                if not text:
++                    continue
++
++                is_noise = self._is_reference_noise(
++                    paragraph,
++                    text,
++                )
++
++                is_first_meaningful = (
++                    not is_noise
++                    and meaningful_count == 0
++                )
++
++                if not is_noise:
++                    meaningful_count += 1
++
++                # ENTER REFERENCES
++                if (
++                    not in_references
++                    and page_index >= min_page_index
++                    and self._is_reference_heading(text)
++                ):
++                    in_references = True
++                    detected_reference = True
++
++                    logger.info(
++                        "[REFERENCE-SKIP] bibliography detected "
++                        f"on page {page_index + 1}: {text!r}"
++                    )
++
++                    # Keep References heading translatable.
++                    continue
++
++                if not in_references:
++                    continue
++
++                # EXIT 1: explicit text fallback
++                if self._is_reference_end_heading(text):
++                    logger.info(
++                        "[REFERENCE-SKIP] bibliography ended "
++                        f"before page {page_index + 1} "
++                        f"by heading text: {text!r}"
++                    )
++
++                    in_references = False
++                    continue
++
++                # EXIT 2: strong structural signal
++                if self._is_strong_post_reference_structure(
++                    paragraph
++                ):
++                    logger.info(
++                        "[REFERENCE-SKIP] bibliography ended "
++                        f"before page {page_index + 1} "
++                        "by structural label "
++                        f"{getattr(paragraph, 'layout_label', None)!r}: "
++                        f"{text[:160]!r}"
++                    )
++
++                    in_references = False
++                    continue
++
++                # EXIT 3: new-page heading
++                if (
++                    is_first_meaningful
++                    and self._is_heading_like_layout(
++                        paragraph
++                    )
++                ):
++                    logger.info(
++                        "[REFERENCE-SKIP] bibliography ended "
++                        f"before page {page_index + 1} "
++                        "by first-page heading label "
++                        f"{getattr(paragraph, 'layout_label', None)!r}: "
++                        f"{text[:160]!r}"
++                    )
++
++                    in_references = False
++                    continue
++
++                # Still inside bibliography
++                self._reference_skip_ids.add(
++                    id(paragraph)
++                )
++                skipped += 1
++
++        if not detected_reference:
++            logger.info(
++                "[REFERENCE-SKIP] no bibliography heading detected; "
++                "normal translation will be used."
++            )
++        else:
++            logger.info(
++                "[REFERENCE-SKIP] "
++                f"{skipped} bibliography paragraph(s) "
++                "will bypass the LLM."
++            )
++
++    # <<< REFERENCE SKIP HELPERS <<<
++
+ 
+     def calc_token_count(self, text: str) -> int:
+         try:
+@@ -234,6 +646,15 @@
+         paragraphs = []
+         total_token_count = 0
+         for paragraph in page.pdf_paragraph:
++
++            # REFERENCE SKIP:
++            # Bibliography entries should not consume terminology-extraction
++            # tokens either.
++            if id(paragraph) in self._reference_skip_ids:
++                if pbar:
++                    pbar.advance(1)
++                continue
++
+             if paragraph.debug_id is None or paragraph.unicode is None:
+                 pbar.advance(1)
+                 continue
+@@ -356,6 +777,10 @@
+ 
+     def procress(self, doc_il: ILDocument):
+         logger.info(f"{self.stage_name}: Starting term extraction for document.")
++
++        # REFERENCE SKIP:
++        # Detect bibliography before sending text to the terminology LLM.
++        self._prepare_reference_skip_ids(doc_il)
+         start_total, start_prompt, start_completion, start_cache_hit_prompt = (
+             self._snapshot_token_usage()
+         )

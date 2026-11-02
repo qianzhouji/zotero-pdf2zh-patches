@@ -1,0 +1,476 @@
+--- a/il_translator_llm_only.py
++++ b/il_translator_llm_only.py
+@@ -34,7 +34,12 @@
+ from babeldoc.translator.translator import BaseTranslator
+ from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
+ 
++from babeldoc.format.pdf.document_il.utils.inline_math_protect import (
++    get_audit, parse_outputs, restore_markers, locked_slots, assemble_slots,
++)
++
+ logger = logging.getLogger(__name__)
++# INLINE MATH PROTECT V2
+ 
+ 
+ PROMPT_TEMPLATE = Template(
+@@ -52,6 +57,9 @@
+    - Copy every CITE marker EXACTLY ONCE.
+    - Keep each CITE marker attached to the SAME preceding word, phrase, or clause as in the input.
+    - NEVER move a CITE marker to the beginning of a sentence, before a verb, or onto another phrase.
++   - Markers like [[MATH:1]] are opaque mathematical spans from the source PDF.
++   - Copy every MATH marker exactly once, in the same order, and in its original inline position.
++   - Never translate, alter, split, duplicate, omit, or move a MATH marker.
+ 4. Translate ALL human-readable content into $lang_out.
+ 
+ ## Do NOT Modify
+@@ -111,6 +119,15 @@
+         self.trackers = [page_tracker.new_paragraph() for _ in paragraphs]
+ 
+ 
++    @classmethod
++    def for_guarded_retry(cls, paragraph, page, tracker):
++        batch = cls.__new__(cls)
++        batch.paragraphs = [paragraph]
++        batch.pages = [page]
++        batch.trackers = [tracker]
++        return batch
++
++
+ class ILTranslatorLLMOnly:
+     stage_name = "Translate Paragraphs"
+ 
+@@ -153,6 +170,7 @@
+         self.ok_count = 0
+         self.fallback_count = 0
+         self.total_count = 0
++        self._math_audit = get_audit(translation_config)
+         self._reference_skip_ids: set[int] = set()
+ 
+ 
+@@ -671,6 +689,7 @@
+             logger.debug(f"save translate tracking to {path}")
+             with Path(path).open("w", encoding="utf-8") as f:
+                 f.write(tracker.to_json())
++        self._math_audit.summary()
+         logger.info(
+             f"Translation completed. Total: {self.total_count}, Successful: {self.ok_count}, Fallback: {self.fallback_count}"
+         )
+@@ -1057,6 +1076,41 @@
+                 mp_id=self.mid,
+             )
+ 
++    def _guarded_fallback(
++        self, paragraph, page, tracker, pbar, page_font_map, xobj_font_map,
++        title_paragraph, local_title_paragraph, executor, mp_id, already_retried, reason,
++    ):
++        """All formula/citation failures share one guarded retry; then keep source."""
++        last_tracker = tracker.last_llm_translate_tracker()
++        if last_tracker:
++            last_tracker.set_fallback_to_translate()
++        if already_retried:
++            self.total_count += 1
++            self.fallback_count += 1
++            self._math_audit.record(
++                "source_preserved", paragraph_id=paragraph.debug_id,
++                page=page.page_number + 1, reason=reason,
++                source=(paragraph.unicode or "")[:4000],
++            )
++            if pbar:
++                pbar.advance(1)
++            return
++        self._math_audit.record(
++            "retry", paragraph_id=paragraph.debug_id, page=page.page_number + 1,
++            reason=reason, source=(paragraph.unicode or "")[:4000],
++        )
++        batch = BatchParagraph.for_guarded_retry(paragraph, page, tracker)
++        kwargs = dict(
++            pbar=pbar, page_font_map=page_font_map, xobj_font_map=xobj_font_map,
++            title_paragraph=title_paragraph, local_title_paragraph=local_title_paragraph,
++            executor=executor, paragraph_token_count=self.calc_token_count(paragraph.unicode),
++            mp_id=mp_id, _guard_retry=True, _guard_reason=reason[:1000],
++        )
++        if executor is None:
++            self.translate_paragraph(batch, **kwargs)
++        else:
++            executor.submit(self.translate_paragraph, batch, **kwargs)
++
+     def translate_paragraph(
+         self,
+         batch_paragraph: BatchParagraph,
+@@ -1068,6 +1122,8 @@
+         executor: PriorityThreadPoolExecutor | None = None,
+         paragraph_token_count: int = 0,
+         mp_id: int = 0,
++        _guard_retry: bool = False,
++        _guard_reason: str = "",
+     ):
+         """Translate a paragraph using pre and post processing functions."""
+         self.translation_config.raise_if_cancelled()
+@@ -1076,6 +1132,7 @@
+             inputs = []
+             llm_translate_trackers = []
+             paragraph_unicodes = []
++            paragraph_compositions = []
+             for i in range(len(batch_paragraph.paragraphs)):
+                 paragraph = batch_paragraph.paragraphs[i]
+                 tracker = batch_paragraph.trackers[i]
+@@ -1102,9 +1159,13 @@
+                     )
+                 )
+                 paragraph_unicodes.append(paragraph.unicode)
++                paragraph_compositions.append(paragraph.pdf_paragraph_composition)
+             if not inputs:
+                 return
+             json_format_input = []
++            # INLINE MATH PROTECT V1: local marker maps are not sent as metadata.
++            math_guard_maps = []
++            protected_marker_maps = []
+ 
+             for id_, input_text in enumerate(inputs):
+                 ti: il_translator.ILTranslator.TranslateInput = input_text[1]
+@@ -1146,16 +1207,47 @@
+                         flush=True,
+                     )
+ 
++                # Protect every remaining BabelDOC formula placeholder. Numeric
++                # citation placeholders have already become [[CITE:...]] above.
++                _math_map = {}
++                _protected_hints = dict(placeholders_hint or {})
++                _formula_placeholders = [
++                    placeholder
++                    for placeholder in ti.placeholders
++                    if isinstance(placeholder, il_translator.FormulaPlaceholder)
++                    and placeholder.placeholder in protected_input
++                ]
++                _formula_placeholders.sort(
++                    key=lambda placeholder: protected_input.find(placeholder.placeholder)
++                )
++                for _formula_placeholder in _formula_placeholders:
++                    _raw_placeholder = _formula_placeholder.placeholder
++                    while _raw_placeholder in protected_input:
++                        _marker_id = str(len(_math_map) + 1)
++                        _marker = f"[[MATH:{_marker_id}]]"
++                        protected_input = protected_input.replace(_raw_placeholder, _marker, 1)
++                        _math_map[_marker_id] = _raw_placeholder
++                        if _raw_placeholder in _protected_hints:
++                            _protected_hints[_marker] = _protected_hints[_raw_placeholder]
++                    _protected_hints.pop(_raw_placeholder, None)
++                math_guard_maps.append(_math_map)
++                _marker_map = {f"[[CITE:{ph.strip('{}')}:{value}]]": ph
++                               for ph, value in protected_refs}
++                _marker_map.update({f"[[MATH:{key}]]": value for key, value in _math_map.items()})
++                protected_marker_maps.append(_marker_map)
++                if _marker_map and not _guard_retry:
++                    self._math_audit.record("guarded", paragraph_id=input_text[2].debug_id)
++
+                 obj = {
+                     "id": id_,
+                     "input": protected_input,
+                     "layout_label": input_text[2].layout_label,
+                 }
+                 if (
+-                    placeholders_hint
++                    _protected_hints
+                     and self.translation_config.add_formula_placehold_hint
+                 ):
+-                    obj["formula_placeholders_hint"] = placeholders_hint
++                    obj["formula_placeholders_hint"] = _protected_hints
+                 json_format_input.append(obj)
+ 
+             json_format_input_str = json.dumps(
+@@ -1173,15 +1265,61 @@
+                 batch_text_for_glossary_matching=batch_text_for_glossary_matching,
+             )
+ 
++            _slot_parts = _slot_requests = None
++            if _guard_retry:
++                _slot_parts, _slot_requests = locked_slots(json_format_input[0]["input"])
++                final_input = self._build_llm_prompt(
++                    json_input_str=json.dumps(_slot_requests, ensure_ascii=False, indent=2),
++                    title_paragraph=title_paragraph,
++                    local_title_paragraph=local_title_paragraph,
++                    batch_text_for_glossary_matching=json_format_input[0]["input"],
++                )
++                correction = (
++                    "## Independent fragment translation\n"
++                    "This input is one independent fragment bounded by immutable formulas. "
++                    "Translate ONLY the words inside this item's input. It may be an incomplete sentence. "
++                    "Keep it an incomplete fragment: do not finish the sentence, omit words, "
++                    "invent variables, or add MATH/CITE markers. Preserve tags.\n\n"
++                )
+             for llm_translate_tracker in llm_translate_trackers:
+                 llm_translate_tracker.set_input(final_input)
+-            llm_output = self.translate_engine.llm_translate(
+-                final_input,
+-                rate_limit_params={
+-                    "paragraph_token_count": paragraph_token_count,
+-                    "request_json_mode": True,
+-                },
+-            )
++            if _guard_retry:
++                # Each fragment has its own request. A model cannot transfer a
++                # phrase to a different slot when that other slot is not visible.
++                _slot_outputs = []
++                _retry_prompts = []
++                for _slot in _slot_requests:
++                    _request = [{"id": 0, "input": _slot["input"], "layout_label": "locked_text_slot"}]
++                    _prompt = self._build_llm_prompt(
++                        json_input_str=json.dumps(_request, ensure_ascii=False),
++                        title_paragraph=title_paragraph,
++                        local_title_paragraph=local_title_paragraph,
++                        batch_text_for_glossary_matching=_slot["input"],
++                    )
++                    _prompt = _prompt.replace("## Here is the input:", correction + "## Here is the input:", 1)
++                    _retry_prompts.append(_prompt)
++                    _response = self.translate_engine.llm_translate(
++                        _prompt, rate_limit_params={
++                            "paragraph_token_count": self.calc_token_count(_slot["input"]),
++                            "request_json_mode": True,
++                        },
++                    )
++                    _value = parse_outputs(json.loads(self._clean_json_output(_response.strip())), 1)[0]
++                    assemble_slots([("slot", _slot["id"])], [_slot], {_slot["id"]: _value})
++                    _slot_outputs.append({"id": _slot["id"], "output": _value})
++                self._math_audit.record("slot_retry", paragraph_id=inputs[0][2].debug_id,
++                                        slots=len(_slot_requests), input=_slot_requests, output=_slot_outputs)
++                for llm_translate_tracker in llm_translate_trackers:
++                    llm_translate_tracker.set_input(json.dumps(_retry_prompts, ensure_ascii=False))
++                llm_output = json.dumps(_slot_outputs, ensure_ascii=False)
++            else:
++                llm_output = self.translate_engine.llm_translate(
++                    final_input,
++                    rate_limit_params={
++                        "paragraph_token_count": paragraph_token_count,
++                        "request_json_mode": True,
++                    },
++                )
+             for llm_translate_tracker in llm_translate_trackers:
+                 llm_translate_tracker.set_output(llm_output)
+             llm_output = llm_output.strip()
+@@ -1190,20 +1328,11 @@
+ 
+             parsed_output = json.loads(llm_output)
+ 
+-            if isinstance(parsed_output, dict) and parsed_output.get(
+-                "output", parsed_output.get("input", False)
+-            ):
+-                parsed_output = [parsed_output]
+-
+-            translation_results = {
+-                item["id"]: item.get("output", item.get("input"))
+-                for item in parsed_output
+-            }
+-
+-            if len(translation_results) != len(inputs):
+-                raise Exception(
+-                    f"Translation results length mismatch. Expected: {len(inputs)}, Got: {len(translation_results)}"
+-                )
++            if _guard_retry:
++                _slot_outputs = parse_outputs(parsed_output, len(_slot_requests))
++                translation_results = {0: assemble_slots(_slot_parts, _slot_requests, _slot_outputs)}
++            else:
++                translation_results = parse_outputs(parsed_output, len(inputs))
+ 
+             for id_, output in translation_results.items():
+                 should_fallback = True
+@@ -1226,49 +1355,11 @@
+                     translate_input = inputs[id_][1]
+                     llm_translate_tracker = inputs[id_][4]
+ 
+-                    # CITATION PROTECT:
+-                    # Verify numeric citation markers survived the LLM,
+-                    # then restore them to BabelDOC's original {vN} placeholders.
+-                    _citation_value_re = re.compile(
+-                        r"^\d+(?:\s*[-–—]\s*\d+)?"
+-                        r"(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*(?:\s*,)?$"
++                    # Validate CITE and MATH together before restoring any PDF object.
++                    translated_text = restore_markers(
++                        inputs[id_][0], json_format_input[id_]["input"], translated_text,
++                        protected_marker_maps[id_],
+                     )
+-                    _citation_marker_re = re.compile(
+-                        r"\[\[\s*CITE\s*:\s*(v\d+)\s*:"
+-                        r"\s*([0-9,\s\-–—]+)\s*\]\]"
+-                    )
+-
+-                    _expected_cite_ids = []
+-                    _hints = translate_input.get_placeholders_hint()
+-
+-                    if _hints:
+-                        for _ph, _value in _hints.items():
+-                            _value_s = str(_value).strip()
+-                            if _citation_value_re.fullmatch(_value_s):
+-                                _expected_cite_ids.append(_ph.strip("{}"))
+-
+-                    if _expected_cite_ids:
+-                        _actual = _citation_marker_re.findall(translated_text)
+-                        _actual_cite_ids = [x[0] for x in _actual]
+-
+-                        if _actual_cite_ids != _expected_cite_ids:
+-                            raise ValueError(
+-                                "Citation marker mismatch: "
+-                                f"expected={_expected_cite_ids}, "
+-                                f"actual={_actual_cite_ids}, "
+-                                f"output={translated_text!r}"
+-                            )
+-
+-                        translated_text = _citation_marker_re.sub(
+-                            lambda m: "{" + m.group(1) + "}",
+-                            translated_text,
+-                        )
+-
+-                        print(
+-                            f"[CITATION-PROTECT] restored "
+-                            f"{len(_expected_cite_ids)} citation marker(s)",
+-                            flush=True,
+-                        )
+ 
+                     input_unicode = inputs[id_][0]
+                     output_unicode = translated_text
+@@ -1328,73 +1419,81 @@
+                         pbar.advance(1)
+                 except Exception as e:
+                     error_message = f"Error translating paragraph. Error: {e}."
+-                    logger.exception(error_message)
+-                    # Ignore error and continue
+-                    for llm_translate_tracker in llm_translate_trackers:
+-                        llm_translate_tracker.set_error_message(error_message)
+-                    continue
++                    logger.warning(error_message)
++                    inputs[id_][4].set_error_message(error_message)
++                    if protected_marker_maps[id_]:
++                        self._math_audit.record(
++                            "rejected", paragraph_id=inputs[id_][2].debug_id,
++                            retry=_guard_retry, reason=error_message,
++                            input=json_format_input[id_]["input"], output=str(output)[:8000],
++                        )
+                 finally:
++                    if should_fallback:
++                        # post_translate can set unicode before parsing raises; restore both.
++                        inputs[id_][2].unicode = paragraph_unicodes[id_]
++                        inputs[id_][2].pdf_paragraph_composition = paragraph_compositions[id_]
++                        inputs[id_][4].set_fallback_to_translate()
++                        page = batch_paragraph.pages[should_translate_paragraph[id_]]
++                        guarded = any(isinstance(p, il_translator.FormulaPlaceholder)
++                                      for p in inputs[id_][1].placeholders)
++                        if guarded:
++                            self._guarded_fallback(
++                                inputs[id_][2], page, inputs[id_][3], pbar,
++                                page_font_map, xobj_font_map, title_paragraph,
++                                local_title_paragraph, executor, mp_id, _guard_retry,
++                                inputs[id_][4].error_message or "Translation validation failed",
++                            )
++                        else:
++                            self.total_count += 1
++                            self.fallback_count += 1
++                            paragraph_token_count = self.calc_token_count(inputs[id_][2].unicode)
++                            executor.submit(
++                                self.il_translator.translate_paragraph,
++                                inputs[id_][2], page, pbar, inputs[id_][3],
++                                page_font_map, xobj_font_map,
++                                priority=1048576 - paragraph_token_count,
++                                paragraph_token_count=paragraph_token_count,
++                                title_paragraph=title_paragraph,
++                                local_title_paragraph=local_title_paragraph,
++                            )
++                    else:
++                        self.total_count += 1
++                        self.ok_count += 1
++                        if protected_marker_maps[id_]:
++                            self._math_audit.record(
++                                "restored", paragraph_id=inputs[id_][2].debug_id,
++                                retry=_guard_retry, marker_count=len(protected_marker_maps[id_]),
++                            )
++
++        except Exception as e:
++            error_message = f"Error {e} during batch translation"
++            logger.warning(error_message)
++            for index, input_ in enumerate(inputs):
++                input_[2].unicode = paragraph_unicodes[index]
++                input_[2].pdf_paragraph_composition = paragraph_compositions[index]
++                input_[4].set_error_message(error_message)
++                input_[4].set_fallback_to_translate()
++                page = batch_paragraph.pages[should_translate_paragraph[index]]
++                guarded = any(isinstance(p, il_translator.FormulaPlaceholder)
++                              for p in input_[1].placeholders)
++                if guarded:
++                    self._guarded_fallback(
++                        input_[2], page, input_[3], pbar, page_font_map, xobj_font_map,
++                        title_paragraph, local_title_paragraph, executor, mp_id,
++                        _guard_retry, error_message,
++                    )
++                else:
+                     self.total_count += 1
+-                    if should_fallback:
+-                        self.fallback_count += 1
+-                        inputs[id_][4].set_fallback_to_translate()
+-                        logger.warning(
+-                            f"Fallback to simple translation. paragraph id: {inputs[id_][2].debug_id}"
+-                        )
+-                        paragraph_token_count = self.calc_token_count(
+-                            inputs[id_][2].unicode
+-                        )
+-                        paragraph_unicodes = inputs[id_][5]
+-                        inputs[id_][2].unicode = paragraph_unicodes[id_]
+-                        executor.submit(
+-                            self.il_translator.translate_paragraph,
+-                            inputs[id_][2],
+-                            batch_paragraph.pages[id_],
+-                            pbar,
+-                            inputs[id_][3],
+-                            page_font_map,
+-                            xobj_font_map,
+-                            priority=1048576 - paragraph_token_count,
+-                            paragraph_token_count=paragraph_token_count,
+-                            title_paragraph=title_paragraph,
+-                            local_title_paragraph=local_title_paragraph,
+-                        )
+-                    else:
+-                        self.ok_count += 1
+-
+-        except Exception as e:
+-            error_message = f"Error {e} during translation. try fallback"
+-            logger.warning(error_message)
+-            for llm_translate_tracker in llm_translate_trackers:
+-                llm_translate_tracker.set_error_message(error_message)
+-                llm_translate_tracker.set_fallback_to_translate()
+-            self.total_count += len(llm_translate_trackers)
+-            self.fallback_count += len(llm_translate_trackers)
+-            for input_ in inputs:
+-                input_[2].unicode = input_[5]
+-            if not should_translate_paragraph:
+-                should_translate_paragraph = list(
+-                    range(len(batch_paragraph.paragraphs))
+-                )
+-            for i in should_translate_paragraph:
+-                paragraph = batch_paragraph.paragraphs[i]
+-                tracker = batch_paragraph.trackers[i]
+-                if paragraph.debug_id is None:
+-                    continue
+-                paragraph_token_count = self.calc_token_count(paragraph.unicode)
+-                executor.submit(
+-                    self.il_translator.translate_paragraph,
+-                    paragraph,
+-                    batch_paragraph.pages[i],
+-                    pbar,
+-                    tracker,
+-                    page_font_map,
+-                    xobj_font_map,
+-                    priority=1048576 - paragraph_token_count,
+-                    paragraph_token_count=paragraph_token_count,
+-                    title_paragraph=title_paragraph,
+-                    local_title_paragraph=local_title_paragraph,
+-                )
++                    self.fallback_count += 1
++                    paragraph_token_count = self.calc_token_count(input_[2].unicode)
++                    executor.submit(
++                        self.il_translator.translate_paragraph,
++                        input_[2], page, pbar, input_[3], page_font_map, xobj_font_map,
++                        priority=1048576 - paragraph_token_count,
++                        paragraph_token_count=paragraph_token_count,
++                        title_paragraph=title_paragraph,
++                        local_title_paragraph=local_title_paragraph,
++                    )
+ 
+     def _build_llm_prompt(
+         self,

@@ -1,0 +1,17 @@
+PASS entire source phi/log/fraction expression is one protected PDF object
+PASS gamma and transit-time parameters remain separate across descriptive prose
+PASS wrapped gamma expression has compact physical-line objects
+PASS title boundaries no longer split the first body lines into fragments
+PASS ['drop', 'valid'] formula objects identical
+PASS ['citation', 'valid'] formula objects identical
+PASS ['reorder', 'valid'] formula objects identical
+PASS ['duplicate', 'valid'] formula objects identical
+PASS ['json', 'valid'] formula objects identical
+PASS ['id', 'valid'] formula objects identical
+PASS ['valid'] formula objects identical
+PASS ['drop', 'drop'] source preserved
+PASS ['valid', 'valid'] source preserved
+PASS ['drop', 'valid'] formula objects identical
+PASS hidden Chinese excluded, visible glyphs preserved
+PASS duplicate and boolean response ids rejected
+ALL OFFLINE CHECKS PASSED; API calls = 0

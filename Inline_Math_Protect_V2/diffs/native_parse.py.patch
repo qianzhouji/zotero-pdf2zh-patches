@@ -1,0 +1,19 @@
+--- a/native_parse.py
++++ b/native_parse.py
+@@ -67,12 +67,15 @@
+             resource_runtime,
+             config=config,
+         )
+-        return run_prepared_pages(
++        docs = run_prepared_pages(
+             sink,
+             config.should_translate_page,
+             prepared_pages,
+             page_interpreter,
+         )
++        # INLINE MATH PROTECT V2: clipped dual-page content is not translatable.
++        from babeldoc.format.pdf.document_il.utils.inline_math_protect import filter_offpage_text
++        return filter_offpage_text(docs, config)
+ 
+ 
+ def parse_with_native_text_only_to_legacy_ir(

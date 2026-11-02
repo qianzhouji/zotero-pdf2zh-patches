@@ -1,0 +1,21 @@
+{
+  "run_id": "44ab59763ec8",
+  "counts": {
+    "guarded": 63,
+    "restored": 63,
+    "rejected": 4,
+    "retry": 6,
+    "slot_retry": 6
+  },
+  "time_seconds": 53.86,
+  "cache_used": true,
+  "final_pdf_sha256": "d99bbb7f028959515fce512ed50e4fb83956e2073e658a7016cb0ed5319af648",
+  "offline_checks": "passed",
+  "installer_roundtrip": "passed",
+  "visual_review_pages": [
+    5,
+    6,
+    9,
+    10
+  ]
+}
